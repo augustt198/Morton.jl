@@ -7,28 +7,165 @@ export morton2tree, morton3tree
 export tree2cartesian, tree3cartesian
 export cartesian2tree, cartesian3tree
 
-### https://fgiesen.wordpress.com/2009/12/13/decoding-morton-codes/
+const has_bmi2 = Base.BinaryPlatforms.CPUID.test_cpu_feature(Base.BinaryPlatforms.CPUID.JL_X86_bmi2)
 
-# "Insert" a 0 bit after each of the 16 low bits of x
-function _Part1By1(x::Integer)
-    x &= 0x0000ffff                   # x = ---- ---- ---- ---- fedc ba98 7654 3210
-    x = (x | (x <<  8)) & 0x00ff00ff  # x = ---- ---- fedc ba98 ---- ---- 7654 3210
-    x = (x | (x <<  4)) & 0x0f0f0f0f  # x = ---- fedc ---- ba98 ---- 7654 ---- 3210
-    x = (x | (x <<  2)) & 0x33333333  # x = --fe --dc --ba --98 --76 --54 --32 --10
-    x = (x | (x <<  1)) & 0x55555555  # x = -f-e -d-c -b-a -9-8 -7-6 -5-4 -3-2 -1-0
-    x+1
+# Access to 32/64 bit pdep/pext instrinsics
+pdep_instr(x::UInt32, y::UInt32) = ccall("llvm.x86.bmi.pdep.32", llvmcall, UInt32, (UInt32, UInt32), x, y)
+pdep_instr(x::UInt64, y::UInt64) = ccall("llvm.x86.bmi.pdep.64", llvmcall, UInt64, (UInt64, UInt64), x, y)
+pext_instr(x::UInt32, y::UInt32) = ccall("llvm.x86.bmi.pext.32", llvmcall, UInt32, (UInt32, UInt32), x, y)
+pext_instr(x::UInt64, y::UInt64) = ccall("llvm.x86.bmi.pext.64", llvmcall, UInt64, (UInt64, UInt64), x, y)
+
+# Use 32 bit pdep/pext for smaller types
+pdep_instr(x::T, y::T) where {T<:Union{UInt8, UInt16}} = pdep(UInt32(x), UInt32(y)) % T
+pext_instr(x::T, y::T) where {T<:Union{UInt8, UInt16}} = pext(UInt32(x), UInt32(y)) % T
+
+# 128 bit pdep/pext: https://www.talkchess.com/forum3/viewtopic.php?f=7&t=78804#p913803
+function pdep_instr(x::UInt128, y::UInt128)
+    lo = pdep_instr(x % UInt64, y % UInt64)
+    hi = pdep_instr((x >> count_ones(y % UInt64)) % UInt64, (y >> 64) % UInt64)
+    lo | (hi << 64)
 end
 
-# "Insert" two 0 bits after each of the 10 low bits of x
-function _Part1By2(x::Integer)
-    x &= 0x000003ff                   # x = ---- ---- ---- ---- ---- --98 7654 3210
-    x = (x | (x << 16)) & 0xff0000ff  # x = ---- --98 ---- ---- ---- ---- 7654 3210
-    x = (x | (x <<  8)) & 0x0300f00f  # x = ---- --98 ---- ---- 7654 ---- ---- 3210
-    x = (x | (x <<  4)) & 0x030c30c3  # x = ---- --98 ---- 76-- --54 ---- 32-- --10
-    x = (x | (x <<  2)) & 0x09249249  # x = ---- 9--8 --7- -6-- 5--4 --3- -2-- 1--0
-    x+1
+function pext_instr(x::UInt128, y::UInt128)
+    lo = pdep_instr(x % UInt64, y % UInt64)
+    hi = pdep_instr((x >> 64) % UInt64, (y >> 64) % UInt64)
+    lo | (hi << count_ones(y % UInt64))
 end
 
+isbitset(x, bit) = ((x >> bit) & 1) == 1
+n_ones(T, n) = (T(1) << n) - T(1) # return the lower n bits set to 1
+
+# Create masks needed to emulate a PDEP instruction pdep(?, y)
+# in a divide-and-conquer way. These are also used for PEXT.
+function pdep_emu_masks(y::T) where {T <: Unsigned}
+    nset = count_ones(y)
+    # Mask to keep only the lower nset bits
+    startmask = n_ones(T, nset)
+
+    bitwidth = 8*sizeof(T)
+    bitpower = trailing_zeros(bitwidth) # i.e. T is 2^bitpower bits wide
+    masks = map((bitpower-1):-1:0) do pow
+        mask = T(0)
+        count = 0 # as we go through the bits of y, keep track of how many 1s so far
+
+        for bitindex in 0:(bitwidth-1)
+            if isbitset(y, bitindex)
+                diff = bitindex - count # the bit at bitindex should be shifted by this
+                already = diff & ~n_ones(T, pow+1) # how much of the shift has been done already
+                if isbitset(diff, pow) # if the `pow` shifting step contributes to the total shift
+                                       # (reminiscent of exponentiation by squaring)
+                    mask |= T(1) << (count + already)
+                end
+                count += 1
+            end
+        end
+
+        mask
+    end
+
+    y, startmask, tuple(masks...)
+end
+
+# Apply the masks to emulate PDEP on x
+function pdep_emu(x::Unsigned, maskset)
+    y, start, masks = maskset
+    x = x & start
+    for (i, mask) in enumerate(masks)
+        shift = 1 << (length(masks) - i)
+        # shift the masked bits and fix the unmasked ones
+        x = ((x & mask) << shift) | (x & ~mask)
+    end
+    return x
+end
+
+# Apply the masks to emulate PEXT on x
+function pext_emu(x::Unsigned, maskset)
+    y, start, masks = maskset
+    for (i, mask) in enumerate(reverse(masks))
+        shift = 1 << (i - 1)
+        x = ((x & (mask << shift)) >> shift) | (x & ~mask)
+    end
+    return x & start
+end
+
+# Use native pdep/pext if available
+pdep(x, maskset) = has_bmi2 ? pdep_instr(x, maskset[1]) : pdep_emu(x, maskset)
+pext(x, maskset) = has_bmi2 ? pext_instr(x, maskset[1]) : pext_emu(x, maskset)
+
+# Create integer of type T the i-th bit (0-indexed) is set
+# if func(N, i) is true, where N is the bitwidth of N.
+function bitmask(T, func)
+    m = T(0)
+    bitwidth = 8*sizeof(T)
+    for i = 0:(bitwidth-1)
+        func(bitwidth, i) && (m |= T(1) << i)
+    end
+    return m
+end
+
+const mask_generators = Dict(
+    # generalization of a 0x55555555 mask (every other bit set)
+    :every2 => (N, idx) -> mod(idx, 2) == 0,
+    # generalization of a 0x09249249 mask (every third bit set)
+    :every3 => (N, idx) -> (idx < (N÷3)*3) && mod(idx, 3) == 0
+)
+# define getmasks_<name>(::type) for each key `name` in mask_generators:
+for (name, gen) in mask_generators
+    for type in (:UInt8, :UInt16, :UInt32, :UInt64, :UInt128)
+        constname  = Symbol(:Mmasks_, type, :_, name)
+        methodname = Symbol(:getmasks_, name)
+
+        @eval const $constname = pdep_emu_masks(bitmask($type, $gen))
+        @eval $methodname(::$type) = $constname
+    end
+end
+
+# Reverse of widen
+narrow(::Type{UInt16})  = UInt8
+narrow(::Type{UInt32})  = UInt16
+narrow(::Type{UInt64})  = UInt32
+narrow(::Type{UInt128}) = UInt64
+narrow(x::T) where {T}  = convert(narrow(T), x)
+
+### 2D
+
+function cartesian2morton(x::T, y::T) where {T <: Unsigned}
+    enc2(val) = pdep(val, getmasks_every2(val)) # encode function
+
+    enc2(widen(x)) | enc2(widen(y)) << 1
+end
+
+cartesian2morton(x::T, y::T) where {T <: Signed} = cartesian2morton(unsigned(x), unsigned(y))
+cartesian2morton(c::AbstractArray{<:Integer}) = cartesian2morton(c[1], c[2])
+
+function morton2cartesian(m::T) where {T <: Unsigned}
+    dec2(val) = pext(val, getmasks_every2(val)) # decode function
+
+    dec2(m) % narrow(T), dec2(m >> 1) % narrow(T)
+end
+
+morton2cartesian(m::Signed) = morton2cartesian(unsigned(m))
+
+### 3D
+
+function cartesian3morton(x::T, y::T, z::T) where {T <: Unsigned}
+    enc3(val) = pdep(val, getmasks_every3(val)) # encode function
+
+    enc3(widen(x)) | enc3(widen(y)) << 1 | enc3(widen(z)) << 2
+end
+
+cartesian3morton(x::T, y::T, z::T) where {T <: Signed} = cartesian3morton(unsigned(x), unsigned(y), unsigned(z))
+cartesian3morton(c::AbstractArray{<:Integer}) = cartesian3morton(c[1], c[2], c[3])
+
+function morton3cartesian(m::T) where {T <: Unsigned}
+    dec3(val) = pext(val, getmasks_every3(val)) # decode function
+
+    dec3(m) % narrow(T), dec3(m >> 1) % narrow(T), dec3(m >> 2) % narrow(T)
+end
+
+morton3cartesian(m::Signed) = morton3cartesian(unsigned(m))
+
+# Documentation:
 """
     cartesian2morton(c::Vector) -> m::Integer
 
@@ -40,9 +177,7 @@ julia> cartesian2morton([5,2])
 19
 ```
 """
-function cartesian2morton(c::AbstractVector{T}) where T<:Integer
-    (_Part1By1(c[2]-1) << 1) + _Part1By1(c[1]-1) - 2
-end
+cartesian2morton
 
 """
     cartesian3morton(c::AbstractVector) -> m::Integer
@@ -55,28 +190,7 @@ julia> cartesian3morton([5,2,1])
 67
 ```
 """
-function cartesian3morton(c::AbstractVector{T}) where T<:Integer
-    (_Part1By2(c[3]-1) << 2) + (_Part1By2(c[2]-1) << 1) + _Part1By2(c[1]-1) - 6
-end
-
-
-function _Compact1By1(x::Integer)
-    x &= 0x55555555                   # x = -f-e -d-c -b-a -9-8 -7-6 -5-4 -3-2 -1-0
-    x = (x | (x >>  1)) & 0x33333333  # x = --fe --dc --ba --98 --76 --54 --32 --10
-    x = (x | (x >>  2)) & 0x0f0f0f0f  # x = ---- fedc ---- ba98 ---- 7654 ---- 3210
-    x = (x | (x >>  4)) & 0x00ff00ff  # x = ---- ---- fedc ba98 ---- ---- 7654 3210
-    x = (x | (x >>  8)) & 0x0000ffff  # x = ---- ---- ---- ---- fedc ba98 7654 3210
-    x+1
-end
-
-function _Compact1By2(x::Integer)
-    x &= 0x09249249                   # x = ---- 9--8 --7- -6-- 5--4 --3- -2-- 1--0
-    x = (x | (x >>  2)) & 0x030c30c3  # x = ---- --98 ---- 76-- --54 ---- 32-- --10
-    x = (x | (x >>  4)) & 0x0300f00f  # x = ---- --98 ---- ---- 7654 ---- ---- 3210
-    x = (x | (x >>  8)) & 0xff0000ff  # x = ---- --98 ---- ---- ---- ---- 7654 3210
-    x = (x | (x >> 16)) & 0x000003ff  # x = ---- ---- ---- ---- ---- --98 7654 3210
-    x+1
-end
+cartesian3morton
 
 """
     morton2cartesian(m::Integer) -> [x,y]
@@ -91,10 +205,7 @@ julia> morton2cartesian(19)
  2
 ```
 """
-function morton2cartesian(m::Integer)
-    m -= 1
-    [_Compact1By1(m>>0), _Compact1By1(m>>1)]
-end
+morton2cartesian
 
 """
     morton3cartesian(m::Integer) -> [x,y,z]
@@ -110,10 +221,7 @@ julia> morton3cartesian(67)
  1
 ```
 """
-function morton3cartesian(m::Integer)
-    m -= 1
-    [_Compact1By2(m>>0), _Compact1By2(m>>1), _Compact1By2(m>>2)]
-end
+morton3cartesian
 
 
 function _treeNmorton(t::AbstractVector{T}, ndim::Integer) where T<:Integer
